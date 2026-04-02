@@ -1,3 +1,23 @@
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
-python-multipart>=0.0.9      # required for UploadFile / multipart form-data
+fastapi
+uvicorn
+
+# File handling & utilities
+python-multipart
+
+# Database
+sqlite-utils
+
+# Image processing
+Pillow
+numpy
+opencv-python
+
+# Video processing
+mediapipe
+
+# Audio processing
+librosa
+soundfile
+
+# (Optional but useful)
+scipy
