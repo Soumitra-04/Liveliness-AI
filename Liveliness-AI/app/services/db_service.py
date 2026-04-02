@@ -10,6 +10,8 @@ Its signature and return contract are fixed; the DB implementation
 (SQLAlchemy / async ORM / raw SQL) is deferred to a later step.
 """
 
+from datetime import datetime  # ✅ added
+
 
 def store_metadata(filename: str, file_type: str, file_path: str) -> dict:
     """
@@ -51,5 +53,15 @@ def store_metadata(filename: str, file_type: str, file_path: str) -> dict:
     - Insert a row into the `media_files` table.
     - Return the full ORM object or a serialised dict.
     """
-    # --- STUB: replace with real DB implementation ---
-    raise NotImplementedError("store_metadata() is not yet implemented.")
+    # --- TEMP IMPLEMENTATION FOR MVP (replaces stub) ---
+    
+    try:
+        return {
+            "id": 1,  # dummy ID
+            "filename": filename,
+            "file_type": file_type,
+            "file_path": file_path,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        raise RuntimeError(f"Failed to store metadata: {e}")
