@@ -55,12 +55,16 @@ ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
 
 # ── Force UTF-8 output on Windows (handles box-drawing chars & emoji) ─────────
-if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
-                                  errors="replace", line_buffering=True)
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8",
-                                  errors="replace", line_buffering=True)
+# Always re-wrap stdout/stderr to utf-8 — the conditional check is not
+# reliable when PowerShell pipes output (it lies about the encoding).
+try:
+    import io as _io
+    sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
+                                   errors="replace", line_buffering=True)
+    sys.stderr = _io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8",
+                                   errors="replace", line_buffering=True)
+except Exception:
+    pass  # already wrapped or no buffer attribute (e.g. IDLE)
 
 
 # ── Dependency check ──────────────────────────────────────────────────────────
@@ -301,8 +305,7 @@ def run_inference(
             # This ensures even a 1–2% raw fake score is correctly pulled to FAKE
             # when all three forensic signals agree.
             #
-            # Formula: adjusted = model_fake + f_score * (fake_target - model_fake)
-            #          where fake_target = 85 (i.e. we'd go to 85% fake if f_score=1.0)
+            # Formula: aggressively scale f_score to ensure an override.
             #
             # Override threshold: f_score > 0.30 AND model says REAL (model_fake < 50)
             if f_score > 0.30 and model_fake < 50.0:
@@ -314,6 +317,15 @@ def run_inference(
                 log.info(
                     "Forensic blend applied: model_fake=%.1f%%  forensic=%.3f  "
                     "adjusted_fake=%.1f%%",
+                    model_fake, f_score, fake_prob,
+                )
+            elif f_score > 0.20 and model_fake >= 50.0:
+                fake_prob = min(99.0, model_fake + f_score * (99.0 - model_fake) * 0.30)
+                real_prob = max(1.0, 100.0 - fake_prob)
+                forensic_applied = True
+                log.info(
+                    "Forensic confidence boost: model_fake=%.1f%%  forensic=%.3f  "
+                    "boosted_fake=%.1f%%",
                     model_fake, f_score, fake_prob,
                 )
         except Exception as exc:
@@ -657,7 +669,7 @@ def print_report(result: dict, image_path: Path, heatmap_path: Path | None) -> N
     print(f"  Combined Score    {_bar(forensic_score)}  {forensic_score*100:5.1f}%")
     print()
     if forensic_applied:
-        print(f"  {MAGENTA}{BOLD}⚡ Forensic override applied!{RESET}")
+        print(f"  {MAGENTA}{BOLD}[!] Forensic override applied!{RESET}")
         print(f"  {MAGENTA}   Model raw score: {model_fake_prob:.1f}% FAKE → "
               f"Adjusted: {fake_prob:.1f}% FAKE after forensic blending.{RESET}")
         print(f"  {MAGENTA}   Reason: Image shows screenshot-scrubbed deepfake patterns.{RESET}")

@@ -1,0 +1,48 @@
+02:10:30  INFO      Device: cpu
+02:10:30  INFO      Checkpoint found: best_deepfake_v1.ckpt  (260.8 MB)
+02:10:37  INFO      Loading Lightning checkpoint�
+02:10:38  INFO      Loading pretrained weights from Hugging Face hub (timm/tf_efficientnetv2_s.in21k_ft_in1k)
+02:10:40  INFO      HTTP Request: HEAD https://huggingface.co/timm/tf_efficientnetv2_s.in21k_ft_in1k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+02:10:40  INFO      [timm/tf_efficientnetv2_s.in21k_ft_in1k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
+02:10:40  INFO      SpatialStream: EfficientNet-V2-S loaded (pretrained=True, out_dim=1280)
+02:10:40  INFO      FrequencyStream: phase-spectrum CNN  out_dim=512
+02:10:40  INFO      DeepFakeFusionHead: in=1792  hidden=512  out=2  dropout=(0.50, 0.30)
+02:10:40  INFO      Model ready on cpu  (21.6 M parameters)
+02:10:40  INFO      Image loaded: database\__pycache__\uploads\fake.png  \u2192 tensor (1, 3, 224, 224)
+02:10:41  INFO      Forensic score=0.286  ELA=0.647  LBP=0.078  Geo=0.000  path=database\__pycache__\uploads\fake.png
+02:10:41  INFO      Forensic confidence boost: model_fake=98.9%  forensic=0.286  boosted_fake=98.9%
+
+  [1m[96m╔══════════════════════════════════════════════════╗[0m
+  [1m[96m║   Liveliness-AI  ·  DeepFake Detection Result   ║[0m
+  [1m[96m╚══════════════════════════════════════════════════╝[0m
+
+  Image    :  database\__pycache__\uploads\fake.png
+
+  [1mFake Probability  :  [91m 98.93 %[0m
+  [1mReal Probability  :  [92m  1.07 %[0m
+
+  ████████████████████████████████████████   (98.9% FAKE)
+
+  [1mVerdict     :  [91mFAKE[0m
+  Confidence  :  [93mHIGH[0m
+
+  ─ Interpretation ──────────────────────────────────
+  [91mStrong deepfake signals detected.[0m
+  The model found high-confidence artefacts in both
+  the spatial domain (face texture) and the frequency
+  domain (phase-spectrum checkerboard patterns).
+
+  ─ Forensic Analysis (Screenshot-Resistant Signals) ────
+  ELA Uniformity    [91m█████████████[0m░░░░░░░   64.7%  ⚠ uniform → AI
+  Texture (LBP)     [92m██[0m░░░░░░░░░░░░░░░░░░    7.8%  natural
+  Geometry          [92m[0m░░░░░░░░░░░░░░░░░░░░    0.0%  plausible
+  Combined Score    [92m██████[0m░░░░░░░░░░░░░░   28.6%
+
+  [95m[1m[!] Forensic override applied![0m
+  [95m   Model raw score: 98.9% FAKE → Adjusted: 98.9% FAKE after forensic blending.[0m
+  [95m   Reason: Image shows screenshot-scrubbed deepfake patterns.[0m
+
+
+  [1m[96mModel validation accuracy: 99.88 %  (7 epochs, 20k-sample val set)[0m
+  [1m[96m══════════════════════════════════════════════════════[0m
+

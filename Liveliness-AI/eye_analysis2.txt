@@ -1,0 +1,4 @@
+database\__pycache__\uploads\fake.png: h=673 w=725 eye_y1=0.513 eye_y2=0.726
+uploads\test\real\00001.jpg: h=256 w=256 eye_y1=0.477 eye_y2=0.480
+uploads\test\real\00004.jpg: h=256 w=256 eye_y1=0.467 eye_y2=0.764
+uploads\test\real\00007.jpg: h=256 w=256 eye_y1=0.484 eye_y2=0.473

@@ -270,40 +270,10 @@ def geometry_consistency_score(img_path: str) -> float:
                 _MP_NEW_API = True   # fall through to new API
 
         if _MP_NEW_API or landmarks_list is None:
-            # New API: use FaceDetector as a fallback since FaceMesh Tasks
-            # requires a model file download; instead use Haar + manual scoring
+            # New API: return 0.0 directly to prevent Haar cascade from causing massive false positives.
             # We skip geometry and return 0.0 (no opinion) to avoid crashing.
-            logger.debug("geometry_consistency_score: using Haar fallback")
-            # Do a simple face symmetry check using Haar landmarks instead
-            face_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            )
-            eye_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_eye.xml"
-            )
-            gray_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray_img, 1.1, 5, minSize=(60,60))
-            if len(faces) == 0:
-                return 0.0
-            fx, fy, fw, fh = max(faces, key=lambda f: f[2]*f[3])
-            face_roi = gray_img[fy:fy+fh, fx:fx+fw]
-            eyes = eye_cascade.detectMultiScale(face_roi, 1.1, 3, minSize=(20,20))
-            if len(eyes) < 2:
-                return 0.0
-            # Sort eyes by x position
-            eyes = sorted(eyes, key=lambda e: e[0])
-            ex1, ey1, ew1, eh1 = eyes[0]
-            ex2, ey2, ew2, eh2 = eyes[1]
-            # Eye height asymmetry (should be similar)
-            eye_y1_c = ey1 + eh1 / 2
-            eye_y2_c = ey2 + eh2 / 2
-            y_diff = abs(eye_y1_c - eye_y2_c) / fh
-            # Eye width asymmetry
-            w_diff = abs(ew1 - ew2) / (fw + 1e-6)
-            # Combined Haar-based geometry suspicion
-            suspicion = min(1.0, (y_diff / 0.05 + w_diff / 0.08) / 2)
-            logger.debug("Geometry(Haar) suspicion=%.3f  path=%s", suspicion, img_path)
-            return float(suspicion)
+            logger.debug("geometry_consistency_score: skipped (MediaPipe unavailable or no face).")
+            return 0.0
 
         lm = landmarks_list
 

@@ -1,0 +1,41 @@
+02:09:31  INFO      Device: cpu
+02:09:31  INFO      Checkpoint found: best_deepfake_v1.ckpt  (260.8 MB)
+02:09:38  INFO      Loading Lightning checkpoint�
+02:09:40  INFO      Loading pretrained weights from Hugging Face hub (timm/tf_efficientnetv2_s.in21k_ft_in1k)
+02:09:41  INFO      HTTP Request: HEAD https://huggingface.co/timm/tf_efficientnetv2_s.in21k_ft_in1k/resolve/main/model.safetensors "HTTP/1.1 302 Found"
+02:09:41  INFO      [timm/tf_efficientnetv2_s.in21k_ft_in1k] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors.
+02:09:41  INFO      SpatialStream: EfficientNet-V2-S loaded (pretrained=True, out_dim=1280)
+02:09:41  INFO      FrequencyStream: phase-spectrum CNN  out_dim=512
+02:09:41  INFO      DeepFakeFusionHead: in=1792  hidden=512  out=2  dropout=(0.50, 0.30)
+02:09:41  INFO      Model ready on cpu  (21.6 M parameters)
+02:09:41  INFO      Image loaded: database\__pycache__\uploads\download.jpg  \u2192 tensor (1, 3, 224, 224)
+02:09:43  INFO      Forensic score=0.269  ELA=0.578  LBP=0.109  Geo=0.000  path=database\__pycache__\uploads\download.jpg
+
+  [1m[96m╔══════════════════════════════════════════════════╗[0m
+  [1m[96m║   Liveliness-AI  ·  DeepFake Detection Result   ║[0m
+  [1m[96m╚══════════════════════════════════════════════════╝[0m
+
+  Image    :  database\__pycache__\uploads\download.jpg
+
+  [1mFake Probability  :  [92m  0.04 %[0m
+  [1mReal Probability  :  [92m 99.96 %[0m
+
+  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   (0.0% FAKE)
+
+  [1mVerdict     :  [92mREAL[0m
+  Confidence  :  [93mHIGH[0m
+
+  ─ Interpretation ──────────────────────────────────
+  [92mNo significant deepfake artefacts found.[0m
+  The model considers this image authentic.
+
+  ─ Forensic Analysis (Screenshot-Resistant Signals) ────
+  ELA Uniformity    [91m████████████[0m░░░░░░░░   57.8%  ⚠ uniform → AI
+  Texture (LBP)     [92m██[0m░░░░░░░░░░░░░░░░░░   10.9%  natural
+  Geometry          [92m[0m░░░░░░░░░░░░░░░░░░░░    0.0%  plausible
+  Combined Score    [92m█████[0m░░░░░░░░░░░░░░░   26.9%
+
+
+  [1m[96mModel validation accuracy: 99.88 %  (7 epochs, 20k-sample val set)[0m
+  [1m[96m══════════════════════════════════════════════════════[0m
+
