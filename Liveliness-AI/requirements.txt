@@ -21,3 +21,12 @@ soundfile
 
 # (Optional but useful)
 scipy
+scikit-image       # LBP texture analysis (screenshot_forensics.py)
+
+# ── ML Training (Triple-Stream DeepFake Detector) ────────────────────────────
+# Install these before running train.py
+torch>=2.0.0
+torchvision>=0.15.0
+pytorch-lightning>=2.1.0
+timm>=0.9.0          # EfficientNet-V2-S pretrained backbone
+pandas               # CSV dataset loading

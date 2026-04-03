@@ -1,1 +1,7 @@
-venv
+uploads/
+models/
+logs/
+*.ckpt
+*.pth
+__pycache__/
+.venv/
