@@ -1,1 +1,70 @@
-venv
+# 🔒 Python
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+
+venv/
+env/
+.venv/
+ENV/
+
+# 🔧 VS Code / IDE
+
+.vscode/
+.idea/
+
+# 🧪 Testing / cache
+
+.pytest_cache/
+.coverage
+*.log
+
+# 📦 Build files
+
+dist/
+build/
+*.egg-info/
+
+# 🗂️ Project-specific (VERY IMPORTANT)
+
+# Uploaded files (temp storage)
+
+temp/
+
+# Output files (if used)
+
+output/
+
+# Database (optional: ignore if you don’t want to commit DB)
+
+database/media.db
+
+# OS files
+
+.DS_Store
+Thumbs.db
+
+# 🔊 Audio / Media test files
+
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+
+# 🔐 Environment variables (if added later)
+
+.env
+
+# 🧠 Model files (future)
+
+*.pt
+*.pth
+*.h5
+
+# Jupyter notebooks (if any)
+
+.ipynb_checkpoints/

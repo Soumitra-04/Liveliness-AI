@@ -1,294 +1,252 @@
 """
-Liveliness-AI — Video Analysis Engine
-=======================================
-app/ai_engine/video_rppg.py
-
-Detects unnatural facial motion patterns in video using:
-  • OpenCV  — frame extraction & image processing
-  • MediaPipe FaceMesh — 468-point facial landmark detection
-
-Detection strategy
-------------------
-Real faces produce smooth, physiologically-constrained landmark motion.
-Deepfake / synthetic faces exhibit:
-  1. Landmark jitter       — high-frequency noise between adjacent frames
-  2. Velocity spikes       — sudden unnatural accelerations
-  3. Geometric instability — bounding-box / pose inconsistency across frames
-  4. Low detection rate    — face mesh drops in/out on poor warps
-
-All four signals are combined into a single [0, 1] deepfake-likelihood score.
+ai_engine/video_rppg.py  —  Liveliness-AI
+==========================================
+Rebuilt Production-grade rPPG deepfake detector using the CHROM algorithm
+with robust signal validation and multi-ROI frequency consistency analysis.
 """
+
+from __future__ import annotations
+
+import os
+import warnings
+from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
+from scipy.fft import rfft, rfftfreq
+from scipy.signal import butter, sosfiltfilt
 
-import logging
-from dataclasses import dataclass, field
-from typing import Optional
+# ── MediaPipe Tasks API ────────────────────────────────────────────────────────
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python import core as mp_core
+import mediapipe as mp
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# ═════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═════════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("liveliness_ai.video_rppg")
+MAX_FRAMES   = 180       # Frame limit
+MIN_FRAMES   = 30        # Minimum valid frames required
+TARGET_FPS   = 30.0      # Fallback fps
 
-# ---------------------------------------------------------------------------
-# Tunable constants
-# ---------------------------------------------------------------------------
+CARDIAC_LOW  = 0.8       # ~48 BPM
+CARDIAC_HIGH = 2.5       # ~150 BPM
+BUTTER_ORDER = 4
 
-FRAME_SAMPLE_RATE: int = 5
-MAX_FRAMES: int = 60
+# ROI Landmarks
+LMKS_FOREHEAD    = np.array([10, 67, 69, 104, 108, 151, 299, 337, 338], dtype=np.int32)
+LMKS_LEFT_CHEEK  = np.array([116, 117, 118, 119, 100, 142, 203, 206, 207], dtype=np.int32)
+LMKS_RIGHT_CHEEK = np.array([345, 346, 347, 348, 329, 371, 423, 426, 427], dtype=np.int32)
+ROI_HALF = 18            # 36x36 pixel patches
 
-MAX_FACES: int = 1
-REFINE_LANDMARKS: bool = True
-MIN_DETECTION_CONF: float = 0.5
-MIN_TRACKING_CONF: float = 0.5
+_MP_MODEL_ENV   = "MEDIAPIPE_FACE_LANDMARKER_MODEL"
+_MP_MODEL_LOCAL = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
 
-TRACKED_LANDMARK_IDS: list[int] = [
-    1,
-    152,
-    234,
-    454,
-    33,
-    263,
-    61,
-    291,
-    10,
-    168,
-]
+# ═════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════════════
 
-JITTER_ZSCORE_THRESH: float  = 2.5
-VELOCITY_SPIKE_THRESH: float = 3.0
-JITTER_WEIGHT: float         = 0.40
-VELOCITY_WEIGHT: float       = 0.35
-DETECTION_WEIGHT: float      = 0.15
-GEOMETRY_WEIGHT: float       = 0.10
+def _build_landmarker() -> Optional[mp_vision.FaceLandmarker]:
+    model_path = os.environ.get(_MP_MODEL_ENV, _MP_MODEL_LOCAL)
+    if not os.path.isfile(model_path):
+        warnings.warn("FaceLandmarker model not found. Check path or set env var.")
+        return None
 
-# ---------------------------------------------------------------------------
-# Internal data container
-# ---------------------------------------------------------------------------
+    opts = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_core.base_options.BaseOptions(model_asset_path=model_path),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.45,
+        min_face_presence_confidence=0.45,
+        min_tracking_confidence=0.45,
+    )
+    return mp_vision.FaceLandmarker.create_from_options(opts)
 
-@dataclass
-class _FrameData:
-    landmarks:   list[np.ndarray] = field(default_factory=list)
-    bbox_widths:  list[float]     = field(default_factory=list)
-    bbox_heights: list[float]     = field(default_factory=list)
-    detected_frames: int          = 0
-    total_frames:    int          = 0
+def _landmark_centroid(landmarks, indices: np.ndarray, img_w: int, img_h: int) -> Tuple[int, int]:
+    xs = np.array([landmarks[i].x for i in indices])
+    ys = np.array([landmarks[i].y for i in indices])
+    cx = int(np.clip(xs.mean() * img_w, 0, img_w - 1))
+    cy = int(np.clip(ys.mean() * img_h, 0, img_h - 1))
+    return cx, cy
 
+def _extract_roi_mean(frame_rgb: np.ndarray, cx: int, cy: int) -> np.ndarray:
+    h, w = frame_rgb.shape[:2]
+    x1, x2 = max(0, cx - ROI_HALF), min(w, cx + ROI_HALF)
+    y1, y2 = max(0, cy - ROI_HALF), min(h, cy + ROI_HALF)
+    patch = frame_rgb[y1:y2, x1:x2].astype(np.float64)
+    if patch.size == 0:
+        return np.zeros(3)
+    return patch.reshape(-1, 3).mean(axis=0)
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _chrom_signal(rgb_series: np.ndarray) -> np.ndarray:
+    mu = rgb_series.mean(axis=0)
+    mu = np.where(mu < 1e-6, 1e-6, mu)
+    rn = rgb_series / mu
 
-def process_video(file_path: str) -> tuple[float, str]:
-    logger.info("Starting video analysis: %s", file_path)
+    R, G, B = rn[:, 0], rn[:, 1], rn[:, 2]
+    X = 3.0 * R - 2.0 * G
+    Y = 1.5 * R + G - 1.5 * B
+
+    std_x, std_y = X.std(), Y.std()
+    if std_x < 1e-9: return np.zeros_like(X)
+    if std_y < 1e-9: return X - X.mean()
+
+    alpha = std_x / std_y
+    S = X - alpha * Y
+    S -= S.mean()
+    return S
+
+def _bandpass(signal: np.ndarray, fps: float) -> np.ndarray:
+    if len(signal) < 3 * BUTTER_ORDER * 2 + 1:
+        return signal
+    nyq = fps / 2.0
+    lo = float(np.clip(CARDIAC_LOW / nyq, 1e-4, 0.99))
+    hi = float(np.clip(CARDIAC_HIGH / nyq, lo + 1e-4, 0.9999))
+    sos = butter(BUTTER_ORDER, [lo, hi], btype="bandpass", output="sos")
+    return sosfiltfilt(sos, signal)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIGNAL PROCESSING & SCORING PIPELINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _process_roi(rgb_array: np.ndarray, fps: float) -> Tuple[float, float, float]:
+    """
+    Returns: (signal_strength_std, peak_hz, snr)
+    """
+    raw_chrom = _chrom_signal(rgb_array)
+    raw_std = float(np.std(raw_chrom))
+    
+    filt = _bandpass(raw_chrom, fps)
+    
+    # FFT Analysis
+    n = len(filt)
+    window = np.hanning(n)
+    power = np.abs(rfft(filt * window)) ** 2
+    freqs = rfftfreq(n, d=1.0 / fps)
+    
+    cardiac_mask = (freqs >= CARDIAC_LOW) & (freqs <= CARDIAC_HIGH)
+    if not cardiac_mask.any():
+        return raw_std, 0.0, 0.0
+        
+    c_powers = power[cardiac_mask]
+    peak_idx = np.argmax(c_powers)
+    peak_hz = float(freqs[cardiac_mask][peak_idx])
+    peak_power = c_powers[peak_idx]
+    
+    others_sum = c_powers.sum() - peak_power
+    others_mean = others_sum / max(1, len(c_powers) - 1)
+    
+    snr = float(peak_power / (others_mean + 1e-12))
+    
+    return raw_std, peak_hz, snr
+
+def process_video(file_path: str) -> Tuple[float, str]:
+    if not os.path.isfile(file_path):
+        return 0.0, "File not found."
+
+    landmarker = _build_landmarker()
+    if landmarker is None:
+        return 0.35, "FaceLandmarker model missing."
 
     cap = cv2.VideoCapture(file_path)
     if not cap.isOpened():
-        logger.error("Cannot open video file: %s", file_path)
-        return 0.5, "Could not open video file — analysis inconclusive."
+        landmarker.close()
+        return 0.0, "Could not open video file."
 
-    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps                = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    logger.info("Video — total frames: %d, FPS: %.1f", total_video_frames, fps)
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or TARGET_FPS
+    
+    rgb_buffers = [[], [], []]
+    frames_read = 0
+    
+    try:
+        while frames_read < MAX_FRAMES:
+            ok, frame_bgr = cap.read()
+            if not ok: break
+            frames_read += 1
 
-    frames = _extract_frames(cap, total_video_frames)
-    cap.release()
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            ts = int((frames_read / fps) * 1000)
+            
+            result = landmarker.detect_for_video(mp_image, ts)
+            if not result.face_landmarks:
+                continue
+                
+            lm = result.face_landmarks[0]
+            h, w = frame_rgb.shape[:2]
+            
+            for i, indices in enumerate([LMKS_FOREHEAD, LMKS_LEFT_CHEEK, LMKS_RIGHT_CHEEK]):
+                cx, cy = _landmark_centroid(lm, indices, w, h)
+                rgb_buffers[i].append(_extract_roi_mean(frame_rgb, cx, cy))
+    finally:
+        cap.release()
+        landmarker.close()
+        
+    n_valid = min(len(buf) for buf in rgb_buffers)
+    if n_valid < MIN_FRAMES:
+        return 0.15, "Insufficient face data detected."
 
-    if not frames:
-        logger.warning("No frames could be extracted from: %s", file_path)
-        return 0.5, "No frames extracted — video may be corrupt or empty."
+    rgb_arrays = [np.stack(buf[:n_valid], axis=0) for buf in rgb_buffers]
 
-    logger.info("Extracted %d frames for analysis.", len(frames))
-
-    frame_data = _collect_landmark_data(frames)
-
-    detection_rate = (
-        frame_data.detected_frames / frame_data.total_frames
-        if frame_data.total_frames > 0 else 0.0
+    # Analyze each ROI
+    metrics = []
+    for rgb in rgb_arrays:
+        metrics.append(_process_roi(rgb, fps))
+        
+    stds  = [m[0] for m in metrics]
+    hzs   = [m[1] for m in metrics]
+    snrs  = [m[2] for m in metrics]
+    
+    max_std = max(stds)
+    mean_snr = float(np.mean(snrs))
+    hz_mean = float(np.mean(hzs))
+    hz_spread = max(hzs) - min(hzs)
+    
+    # ── 1. HARD VALIDATION ──────────────────────────────────────────────
+    
+    # Check 1: Is the signal physically too flat (static image)?
+    # Chrominance std < 5e-5 usually perfectly defines camera hardware read noise on flat prints.
+    if max_std < 5e-5:
+        return 0.05, f"FAKE | Extremely low color variance ({max_std:.2e}) indicates static photo."
+        
+    # Check 2: Is the signal severely noisy (rapid movement or light flicker)?
+    if max_std > 0.05:
+        return 0.10, f"FAKE | Unstable lighting or huge artifact variation ({max_std:.2e})."
+        
+    # Check 3: Is there a clear rhythmic heartbeat present?
+    # Mean SNR falls below 1.5 for incoherent broadband noise.
+    if mean_snr < 1.5:
+        return 0.15, f"FAKE | No dominant heart frequency detected (SNR: {mean_snr:.1f})."
+        
+    # ── 2. BALANCED SCORING ─────────────────────────────────────────────
+    
+    # Normalize SNR mapping bounded typically between 1.5 (noise) and 6.0+ (clean pulse)
+    snr_score = np.clip((mean_snr - 1.5) / 4.5, 0.0, 1.0)
+    
+    # Ensure frequency consistency. Real blood flows perfectly synchronously.
+    # Deviation above 0.5 Hz means noise dominates over true pulse alignment.
+    if hz_spread <= 0.2:
+        consistency_score = 1.0
+    elif hz_spread <= 0.5:
+        consistency_score = 0.5
+    else:
+        consistency_score = 0.0
+        
+    raw_score = 0.60 * snr_score + 0.40 * consistency_score
+    score = float(np.clip(raw_score, 0.0, 1.0))
+    
+    bpm = hz_mean * 60.0
+    
+    if score >= 0.65:
+        verdict = "REAL"
+    elif score >= 0.40:
+        verdict = "UNCERTAIN"
+    else:
+        verdict = "FAKE"
+        
+    explanation = (
+        f"{verdict} | HR: {bpm:.1f} bpm | SNR: {mean_snr:.1f} | "
+        f"Strength: {max_std:.2e} | Hz Diff: {hz_spread:.2f}Hz"
     )
-
-    if frame_data.detected_frames < 2:
-        msg = (
-            "No face detected in video — cannot assess landmark motion."
-            if frame_data.detected_frames == 0
-            else "Face detected in too few frames for reliable analysis."
-        )
-        logger.warning(msg)
-        score = 0.35 if frame_data.detected_frames == 0 else 0.45
-        return round(score, 3), msg
-
-    score, explanation = _compute_score(frame_data, detection_rate)
-
-    logger.info("Analysis complete — score: %.3f | %s", score, explanation)
+    
     return score, explanation
-
-
-# ---------------------------------------------------------------------------
-# Step 2 helper — frame extraction
-# ---------------------------------------------------------------------------
-
-def _extract_frames(cap: cv2.VideoCapture, total: int) -> list[np.ndarray]:
-    frames: list[np.ndarray] = []
-    frame_idx = 0
-
-    while len(frames) < MAX_FRAMES:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx % FRAME_SAMPLE_RATE == 0:
-            frames.append(frame)
-
-        frame_idx += 1
-
-    return frames
-
-
-# ---------------------------------------------------------------------------
-# Steps 3 & 4 helper — MediaPipe landmark collection
-# ---------------------------------------------------------------------------
-
-def _collect_landmark_data(frames: list[np.ndarray]) -> _FrameData:
-    data = _FrameData(total_frames=len(frames))
-
-    # Load OpenCV face detector
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-
-    for i, frame in enumerate(frames):
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.3,
-            minNeighbors=5
-        )
-
-        if len(faces) == 0:
-            logger.debug("Frame %d — no face detected.", i)
-            continue
-
-        # Take first detected face
-        (x, y, fw, fh) = faces[0]
-
-        # --- Create pseudo-landmarks (stable key points) ---
-        coords = np.array([
-            [x + fw * 0.5, y + fh * 0.5],   # center
-            [x + fw * 0.5, y + fh],         # chin
-            [x, y + fh * 0.5],              # left
-            [x + fw, y + fh * 0.5],         # right
-            [x + fw * 0.3, y + fh * 0.3],   # left eye approx
-            [x + fw * 0.7, y + fh * 0.3],   # right eye approx
-            [x + fw * 0.3, y + fh * 0.7],   # left mouth approx
-            [x + fw * 0.7, y + fh * 0.7],   # right mouth approx
-            [x + fw * 0.5, y],              # forehead
-            [x + fw * 0.5, y + fh * 0.2],   # upper nose
-        ], dtype=np.float32)
-
-        data.landmarks.append(coords)
-        data.bbox_widths.append(float(fw))
-        data.bbox_heights.append(float(fh))
-        data.detected_frames += 1
-
-    return data
-
-# ---------------------------------------------------------------------------
-# Step 5 helper — score computation
-# ---------------------------------------------------------------------------
-
-def _compute_score(data: _FrameData, detection_rate: float) -> tuple[float, str]:
-
-    lm_array = np.stack(data.landmarks, axis=0)
-
-    displacements = np.linalg.norm(
-        np.diff(lm_array, axis=0),
-        axis=2,
-    )
-
-    mean_disp_per_frame = displacements.mean(axis=1)
-
-    jitter_score = _zscore_outlier_ratio(mean_disp_per_frame, JITTER_ZSCORE_THRESH)
-
-    if len(mean_disp_per_frame) >= 2:
-        acceleration = np.abs(np.diff(mean_disp_per_frame))
-        velocity_score = _zscore_outlier_ratio(acceleration, VELOCITY_SPIKE_THRESH)
-    else:
-        velocity_score = 0.0
-
-    detection_score = max(0.0, 1.0 - detection_rate)
-
-    aspect_ratios = np.array(data.bbox_widths) / (np.array(data.bbox_heights) + 1e-6)
-    geometry_score = float(np.std(aspect_ratios)) if len(aspect_ratios) > 1 else 0.0
-    geometry_score = min(geometry_score / 0.15, 1.0)
-
-    final_score = (
-        JITTER_WEIGHT    * jitter_score    +
-        VELOCITY_WEIGHT  * velocity_score  +
-        DETECTION_WEIGHT * detection_score +
-        GEOMETRY_WEIGHT  * geometry_score
-    )
-    final_score = float(np.clip(final_score, 0.0, 1.0))
-
-    explanation = _build_explanation(
-        final_score, jitter_score, velocity_score, detection_rate, geometry_score
-    )
-
-    return round(final_score, 3), explanation
-
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-
-def _zscore_outlier_ratio(series: np.ndarray, threshold: float) -> float:
-    if len(series) == 0:
-        return 0.0
-    std = series.std()
-    if std < 1e-8:
-        return 0.0
-    z_scores = np.abs((series - series.mean()) / std)
-    return float((z_scores > threshold).mean())
-
-
-def _build_explanation(
-    score: float,
-    jitter: float,
-    velocity: float,
-    detection_rate: float,
-    geometry: float,
-) -> str:
-
-    signals: list[str] = []
-
-    if jitter > 0.3:
-        signals.append("facial landmark jitter")
-    if velocity > 0.3:
-        signals.append("unnatural motion velocity spikes")
-    if detection_rate < 0.7:
-        signals.append(f"low face-detection rate ({detection_rate:.0%})")
-    if geometry > 0.3:
-        signals.append("geometric face instability")
-
-    if score >= 0.75:
-        verdict = "HIGH deepfake likelihood"
-    elif score >= 0.50:
-        verdict = "MODERATE deepfake likelihood"
-    elif score >= 0.25:
-        verdict = "LOW deepfake likelihood"
-    else:
-        verdict = "Video appears authentic"
-
-    if signals:
-        signal_str = "; ".join(signals)
-        return f"{verdict} (score {score:.2f}). Detected: {signal_str}."
-    else:
-        return f"{verdict} (score {score:.2f}). No strong anomalies detected."
