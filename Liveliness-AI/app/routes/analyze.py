@@ -1,13 +1,20 @@
 """
 routes/analyze.py
 =================
-Enhanced POST /analyze endpoint with improved AI scoring.
+POST /analyze endpoint — full multimodal deepfake detection pipeline.
 
-Now includes:
-  - FFT-based frequency analysis
-  - Spatial inconsistency detection
-  - Noise analysis
-  - Combined scoring for better accuracy
+Processing flow
+---------------
+  1. Validate uploaded file
+  2. Save file to disk
+  3. Detect media type  (image / video / audio)
+  4. Store metadata in database
+  5. Route to the correct AI analyser:
+       image → ELA + pretrained deepfake model   (image_ela.py)
+       video → frame-based rPPG detection         (video_rppg.py)
+       audio → Wav2Vec vocal analysis             (audio_vocal.py)
+  6. Fuse per-modality scores into a single trust verdict (fusion.py)
+  7. Attach metadata fields and return
 """
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -15,35 +22,30 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from app.services.file_service import detect_file_type, save_file
 from app.services.db_service import store_metadata
 from app.ai_engine.image_ela import process_image
-
-# ✅ NEW IMPORTS
-from app.ai_engine.spatial import spatial_inconsistency_score
-from app.ai_engine.noise import noise_score
+from app.ai_engine.video_rppg import process_video
+from app.ai_engine.audio_vocal import process_audio
+from app.ai_engine.fusion import combine_results
 
 router = APIRouter()
 
 
 @router.post(
     "/",
-    summary="Analyze an uploaded media file",
-    response_description="Returns authenticity score and explanation.",
+    summary="Analyze an uploaded media file for deepfake indicators",
+    response_description=(
+        "Authenticity score (0–100), risk classification, and per-modality flags."
+    ),
 )
 async def analyze_file(file: UploadFile = File(...)):
 
-    # ------------------------------
-    # Step 1 — Validate file
-    # ------------------------------
+    # ── Step 1 — Validate file ────────────────────────────────────────────────
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
 
-    # ------------------------------
-    # Step 2 — Save file
-    # ------------------------------
+    # ── Step 2 — Save file ────────────────────────────────────────────────────
     file_path: str = await save_file(file)
 
-    # ------------------------------
-    # Step 3 — Detect type
-    # ------------------------------
+    # ── Step 3 — Detect type ──────────────────────────────────────────────────
     file_type: str = detect_file_type(file.filename)
 
     if file_type == "unknown":
@@ -55,77 +57,43 @@ async def analyze_file(file: UploadFile = File(...)):
             ),
         )
 
-    # ------------------------------
-    # Step 4 — Store metadata
-    # ------------------------------
+    # ── Step 4 — Store metadata ───────────────────────────────────────────────
     metadata: dict = store_metadata(
         filename=file.filename,
         file_type=file_type,
         file_path=file_path,
     )
 
-    # ------------------------------
-    # Step 5 — AI Analysis
-    # ------------------------------
-    score = 0.5
-    explanation = "Analysis not implemented for this type yet."
+    # ── Step 5 — AI Analysis ──────────────────────────────────────────────────
+
+    # Default results for modalities not active in this request.
+    # fusion.combine_results() requires all three to be present.
+    image_result = (0.0, "No image processed")
+    video_result = (0.0, "No video processed")
+    audio_result = (0.0, "No audio processed")
 
     if file_type == "image":
-        # 🔥 Core FFT analysis
-        fft_score, explanation = process_image(file_path)
-
-        # 🔥 NEW: Spatial + Noise
-        spatial_score = spatial_inconsistency_score(file_path)
-        noise = noise_score(file_path)
-
-        # 🔥 Combine scores (balanced weights)
-        score = (
-            0.5 * fft_score +
-            0.3 * spatial_score +
-            0.2 * noise
-        )
-
-        # 🔥 Improve explanation
-        explanation += (
-            f" | Spatial anomaly: {round(spatial_score,2)}, "
-            f"Noise irregularity: {round(noise,2)}"
-        )
-
-        # 🔥 Boost suspicious cases
-        if fft_score < 0.2 and spatial_score > 0.2:
-            explanation += " However, possible structural inconsistencies detected."
-            score = min(score + 0.2, 1.0)
+        # ELA + pretrained deepfake model → (score, explanation)
+        image_result = process_image(file_path)
 
     elif file_type == "video":
-        score = 0.6
-        explanation = "Video analysis pipeline initialized. Frame-level detection coming soon."
+        # Frame-based rPPG detection → (score, explanation)
+        video_result = process_video(file_path)
 
     elif file_type == "audio":
-        score = 0.55
-        explanation = "Audio analysis pipeline initialized. Voice anomaly detection coming soon."
+        # Wav2Vec vocal / acoustic analysis → (score, explanation)
+        audio_result = process_audio(file_path)
 
-    # ------------------------------
-    # Step 6 — Risk Classification
-    # ------------------------------
-    if score > 0.7:
-        risk = "High"
-    elif score > 0.25:
-        risk = "Medium"
-    else:
-        risk = "Low"
+    # ── Step 6 — Fuse modality scores into final verdict ──────────────────────
+    final_output: dict = combine_results(
+        image_result=image_result,
+        video_result=video_result,
+        audio_result=audio_result,
+    )
 
-    # 🔥 Highlight suspicious cases
-    if "structural inconsistencies" in explanation:
-        explanation = "⚠️ " + explanation
+    # ── Step 7 — Attach metadata and return ───────────────────────────────────
+    final_output["id"]        = metadata["id"]
+    final_output["filename"]  = metadata["filename"]
+    final_output["file_type"] = metadata["file_type"]
 
-    # ------------------------------
-    # Step 7 — Response
-    # ------------------------------
-    return {
-        "id": metadata["id"],
-        "filename": metadata["filename"],
-        "file_type": metadata["file_type"],
-        "confidence": round(score * 100, 2),
-        "risk": risk,
-        "explanation": explanation,
-    }
+    return final_output

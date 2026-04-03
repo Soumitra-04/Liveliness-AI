@@ -1,7 +1,57 @@
+# 🔒 Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# 🔧 VS Code / IDE
+.vscode/
+.idea/
+
+# 🧪 Testing / cache
+.pytest_cache/
+.coverage
+*.log
+
+# 📦 Build files
+dist/
+build/
+*.egg-info/
+
+# 🗂️ Project-specific
 uploads/
 models/
 logs/
-*.ckpt
+temp/
+output/
+
+# Database
+database/media.db
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# 🔊 Audio / Media test files
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+
+# 🔐 Environment variables
+.env
+
+# 🧠 Model weights
+*.pt
 *.pth
-__pycache__/
-.venv/
+*.ckpt
+*.h5
+
+# Jupyter notebooks
+.ipynb_checkpoints/
