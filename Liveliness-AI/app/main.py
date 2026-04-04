@@ -19,6 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.analyze import router as analyze_router
 from app.api.video_routes import router as video_router
+from app.api.image_routes import router as image_router
+from app.api.audio_routes import router as audio_router
 
 # ---------------------------------------------------------------------------
 # Application factory
@@ -54,7 +56,8 @@ app.add_middleware(
 # All /analyze logic lives in routes/analyze.py
 app.include_router(analyze_router, prefix="/analyze", tags=["Analysis"])
 app.include_router(video_router,  prefix="/detect",  tags=["Deepfake Detection"])
-
+app.include_router(image_router,  prefix="/detect",  tags=["Deepfake Detection"])
+app.include_router(audio_router,  prefix="/detect",  tags=["Deepfake Detection"])
 
 # ---------------------------------------------------------------------------
 # Health-check (optional but useful for infra monitoring)

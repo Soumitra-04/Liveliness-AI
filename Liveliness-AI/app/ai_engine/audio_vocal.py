@@ -2,6 +2,24 @@ import os, warnings
 from typing import List, Tuple
 import numpy as np
 
+SR = 16000
+LOADED_MODELS = []
+BAND_HUMAN = 0.3
+BAND_UNCERTAIN = 0.7
+
+def load_audio(path):
+    import librosa
+    y, _ = librosa.load(path, sr=SR)
+    return y
+
+def make_chunks(y, chunk_len=SR*3):
+    chunks = [y[i:i+chunk_len] for i in range(0, len(y), chunk_len)]
+    if chunks and len(chunks[-1]) < chunk_len:
+        chunks.pop()
+    if not chunks and len(y) > 0:
+        chunks = [y]  # pad or just use it
+    return chunks
+
 # ── Backend selection ─────────────────────────────────────────────────────────
 
 try:
