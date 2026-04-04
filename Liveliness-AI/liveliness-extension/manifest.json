@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Liveliness-AI Scanner",
+  "version": "1.0",
+  "description": "Right-click to scan images and videos using the local Liveliness-AI server.",
+  "permissions": [
+    "contextMenus",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*",
+    "*://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

@@ -1,224 +1,182 @@
 """
 app/ai_engine/image_ela.py
 ==========================
-Liveliness-AI — Hybrid Deepfake Detection (FINAL VERSION)
+Liveliness-AI | Image Deepfake Detection — API-side processor
 
-Features:
-✔ HuggingFace pretrained model (ViT)
-✔ Spatial + Noise signals
-✔ Adaptive soft fusion (NO hardcoded thresholds)
-✔ Robust error handling
-✔ Explainable AI output
+Pipeline (identical to test_inference.py)
+-----------------------------------------
+  1. PIL.Image.open(file_path).convert("RGB")
+  2. T.Resize((224, 224))
+  3. T.ToTensor()
+  4. T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+  5. model(tensor)   — inside torch.inference_mode()
+  6. softmax → real_prob, fake_prob
+  7. Forensic blend via screenshot_forensics.screenshot_resistant_score()
+
+Model
+-----
+  DeepFakeV1Module (custom trained EfficientNet-V2-S + FrequencyStream)
+  loaded via app.ai_engine.model_singleton (single global instance, eval()
+  set at startup, never set to train() in the API path).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
-from PIL import Image, UnidentifiedImageError
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# MODEL CONFIGURATION
-# ---------------------------------------------------------------------------
 
-_MODEL_ID = "dima806/deepfake_vs_real_image_detection"
+# ══════════════════════════════════════════════════════════════════════════════
+# Public API
+# ══════════════════════════════════════════════════════════════════════════════
 
-_CLASSIFIER = None
-_LOAD_ERROR: Optional[str] = None
+def process_image(file_path: str) -> Tuple[float, str]:
+    """
+    Run deepfake detection on a single image file.
 
+    Parameters
+    ----------
+    file_path : str
+        Absolute or relative path to a saved image (jpg / png / webp …).
 
-def _load_model() -> None:
-    global _CLASSIFIER, _LOAD_ERROR
-
+    Returns
+    -------
+    (score, explanation) where
+      score       : float in [0.0, 1.0]  —  1.0 = authentic, 0.0 = fake
+      explanation : human-readable string describing what was found
+    """
     try:
-        from transformers import pipeline
-
-        logger.info("Loading deepfake detection model...")
-
-        _CLASSIFIER = pipeline(
-            task="image-classification",
-            model=_MODEL_ID,
-        )
-
-        logger.info("Model loaded successfully.")
-
+        import torch
+        import torch.nn.functional as F
     except ImportError:
-        _LOAD_ERROR = "Transformers not installed. Run: pip install transformers torch"
-        logger.error(_LOAD_ERROR)
+        return 0.5, "Error: PyTorch not installed."
 
-    except Exception as e:
-        _LOAD_ERROR = f"Model load failed: {e}"
-        logger.error(_LOAD_ERROR)
-
-
-# Load model at import
-_load_model()
-
-
-# ---------------------------------------------------------------------------
-# MAIN PROCESS FUNCTION
-# ---------------------------------------------------------------------------
-
-def process_image(file_path: str) -> tuple[float, str]:
-    """
-    Hybrid deepfake detection:
-    - Model prediction (HuggingFace)
-    - Spatial analysis
-    - Noise analysis
-    - Adaptive fusion
-
-    Returns:
-        score (0–1): authenticity
-        explanation (str)
-    """
-
-    # ------------------------------
-    # Check model availability
-    # ------------------------------
-    if _CLASSIFIER is None:
-        return 0.5, f"Error: {_LOAD_ERROR}"
-
-    # ------------------------------
-    # Load image safely
-    # ------------------------------
+    # ── 1. Load model singleton ───────────────────────────────────────────────
     try:
-        img = Image.open(file_path)
-        img.verify()
-        img = Image.open(file_path)
-        img = img.convert("RGB")
+        from app.ai_engine.model_singleton import get_model, get_device, preprocess_image_path
+        model  = get_model()
+        device = get_device()
+    except RuntimeError as exc:
+        logger.error("process_image: model not ready — %s", exc)
+        return 0.5, f"Model not loaded: {exc}"
 
-    except FileNotFoundError:
-        return 0.5, f"Error: File not found — {file_path}"
-
-    except UnidentifiedImageError:
-        return 0.5, f"Error: Unsupported image format"
-
-    except Exception as e:
-        return 0.5, f"Error loading image: {e}"
-
-    # ------------------------------
-    # Run model inference
-    # ------------------------------
+    # ── 2. Preprocess (MUST match test_inference.py exactly) ─────────────────
     try:
-        results = _CLASSIFIER(img)
+        tensor = preprocess_image_path(file_path).to(device)   # (1, 3, 224, 224)
+    except Exception as exc:
+        logger.error("process_image: preprocessing failed for %s — %s", file_path, exc)
+        return 0.5, f"Image preprocessing error: {exc}"
 
-    except Exception as e:
-        return 0.5, f"Model inference error: {e}"
+    # ── 3. Forward pass — wrapped in inference_mode for speed + safety ────────
+    # model.eval() was called globally in model_singleton.load_model().
+    # torch.inference_mode() disables autograd tape for zero overhead.
+    try:
+        with torch.inference_mode():
+            logits = model(tensor)                 # (1, 2)
+        probs     = F.softmax(logits, dim=1)[0]   # (2,) on device
+        fake_prob = float(probs[0].item())         # class 0 = fake
+        real_prob = float(probs[1].item())         # class 1 = real
+    except Exception as exc:
+        logger.error("process_image: inference failed — %s", exc)
+        return 0.5, f"Inference error: {exc}"
 
-    # ------------------------------
-    # Parse model output
-    # ------------------------------
-    real_score = None
-    fake_score = None
+    logger.debug(
+        "process_image: raw probs  fake=%.4f  real=%.4f  path=%s",
+        fake_prob, real_prob, file_path,
+    )
 
-    for r in results:
-        label = r.get("label", "").lower()
-        score = float(r.get("score", 0.0))
-
-        if "real" in label:
-            real_score = score
-        elif "fake" in label:
-            fake_score = score
-
-    # Fallback handling
-    if real_score is None and fake_score is None:
-        sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
-        top = sorted_results[0]
-
-        if "real" in top["label"].lower():
-            real_score = top["score"]
-            fake_score = 1 - real_score
-        else:
-            fake_score = top["score"]
-            real_score = 1 - fake_score
-
-    if real_score is None:
-        real_score = 1 - (fake_score or 0.5)
-
-    if fake_score is None:
-        fake_score = 1 - real_score
-
-    # ------------------------------------------------------------------
-    # 🔥 HYBRID SOFT FUSION (NO HARDCODED RULES)
-    # ------------------------------------------------------------------
-
-    spatial = None
-    noise = None
+    # ── 4. Screenshot-resistant forensic blend ────────────────────────────────
+    forensic_score   = 0.0
+    forensic_detail  = {"ela": 0.0, "lbp": 0.0, "geometry": 0.0}
+    forensic_applied = False
+    adjusted_fake    = fake_prob * 100.0   # work in % for the blend
 
     try:
-        from app.ai_engine.spatial import spatial_inconsistency_score
-        from app.ai_engine.noise import noise_score
+        from app.ai_engine.screenshot_forensics import screenshot_resistant_score
+        f_score, f_detail = screenshot_resistant_score(file_path)
+        forensic_score  = f_score
+        forensic_detail = f_detail
 
-        spatial = spatial_inconsistency_score(file_path)
-        noise = noise_score(file_path)
+        model_fake_pct = fake_prob * 100.0
 
-        # Combine auxiliary signals
-        aux_signal = (spatial + noise) / 2
+        # Mirror the exact same blend logic as test_inference.py
+        if f_score > 0.30 and model_fake_pct < 50.0:
+            fake_target    = 85.0
+            blend_amount   = f_score * (fake_target - model_fake_pct)
+            adjusted_fake  = min(99.0, model_fake_pct + blend_amount)
+            forensic_applied = adjusted_fake > 50.0
+            logger.info(
+                "process_image forensic blend: model_fake=%.1f%%  "
+                "forensic=%.3f  adjusted=%.1f%%",
+                model_fake_pct, f_score, adjusted_fake,
+            )
+        elif f_score > 0.20 and model_fake_pct >= 50.0:
+            adjusted_fake = min(99.0, model_fake_pct + f_score * (99.0 - model_fake_pct) * 0.30)
+            forensic_applied = True
 
-        # Adaptive weighting (continuous logic)
-        model_weight = real_score
-        aux_weight = 1 - model_weight
+        # Convert final adjusted fake% back to an authenticity score [0,1]
+        final_real = max(0.0, min(1.0, 1.0 - adjusted_fake / 100.0))
 
-        # Final score calculation
-        final_score = (model_weight * real_score) + (aux_weight * (1 - aux_signal))
+    except Exception as exc:
+        logger.warning("process_image: forensic analysis failed — %s", exc)
+        final_real = real_prob   # fall back to raw model output
 
-        score = round(float(final_score), 4)
-
-    except Exception:
-        # fallback if auxiliary modules fail
-        score = round(float(real_score), 4)
-
-    # ------------------------------
-    # Build explanation
-    # ------------------------------
-    explanation = _build_explanation(score, real_score, fake_score)
-
-    if spatial is not None and noise is not None:
-        explanation += (
-            f" | Spatial anomaly: {round(spatial,2)}, "
-            f"Noise irregularity: {round(noise,2)}"
-        )
+    # ── 5. Build explanation ──────────────────────────────────────────────────
+    score       = round(float(final_real), 4)
+    explanation = _build_explanation(
+        score        = score,
+        real_conf    = real_prob,
+        fake_conf    = fake_prob,
+        forensic_score   = forensic_score,
+        forensic_detail  = forensic_detail,
+        forensic_applied = forensic_applied,
+    )
 
     return score, explanation
 
 
-# ---------------------------------------------------------------------------
-# EXPLANATION FUNCTION
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# Explanation builder
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _build_explanation(score: float, real_conf: float, fake_conf: float) -> str:
-    """
-    Generate human-readable explanation
-    """
-
+def _build_explanation(
+    score: float,
+    real_conf: float,
+    fake_conf: float,
+    forensic_score: float   = 0.0,
+    forensic_detail: dict   = {},
+    forensic_applied: bool  = False,
+) -> str:
     real_pct = round(real_conf * 100, 1)
     fake_pct = round(fake_conf * 100, 1)
 
-    if score >= 0.8:
-        verdict = (
-            "The image is highly likely to be authentic with no strong deepfake indicators."
-        )
-    elif score >= 0.6:
-        verdict = (
-            "The image appears mostly real, though minor inconsistencies may exist."
-        )
-    elif score >= 0.4:
-        verdict = (
-            "The model is uncertain. The image shows mixed characteristics of real and fake content."
-        )
-    elif score >= 0.2:
-        verdict = (
-            "The image likely contains manipulation or artificial generation artifacts."
-        )
+    if score >= 0.80:
+        verdict = "Highly authentic — no significant deepfake artefacts detected."
+    elif score >= 0.60:
+        verdict = "Likely authentic, though minor inconsistencies exist."
+    elif score >= 0.40:
+        verdict = "Uncertain — image shows mixed real/fake characteristics."
+    elif score >= 0.20:
+        verdict = "Likely manipulated — artificial generation artefacts detected."
     else:
-        verdict = (
-            "The image is highly likely to be AI-generated or heavily manipulated."
-        )
+        verdict = "Highly suspicious — strong deepfake or AI-generation evidence."
 
-    return (
+    base = (
         f"{verdict} "
-        f"(Model confidence → Real: {real_pct}% | Fake: {fake_pct}%)"
+        f"(Model → Real: {real_pct}% | Fake: {fake_pct}%)"
     )
+
+    if forensic_applied:
+        ela = round(forensic_detail.get("ela", 0.0) * 100, 1)
+        lbp = round(forensic_detail.get("lbp", 0.0) * 100, 1)
+        geo = round(forensic_detail.get("geometry", 0.0) * 100, 1)
+        base += (
+            f" | Forensic override applied (suspicion={forensic_score*100:.1f}%): "
+            f"ELA={ela}% LBP={lbp}% Geo={geo}%"
+        )
+    elif forensic_score > 0.20:
+        base += f" | Forensic signals mildly suspicious ({forensic_score*100:.0f}%)"
+
+    return base

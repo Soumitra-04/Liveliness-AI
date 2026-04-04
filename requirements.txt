@@ -1,0 +1,23 @@
+fastapi
+uvicorn
+
+# File handling & utilities
+python-multipart
+
+# Database
+sqlite-utils
+
+# Image processing
+Pillow
+numpy
+opencv-python
+
+# Video processing
+mediapipe
+
+# Audio processing
+librosa
+soundfile
+
+# (Optional but useful)
+scipy
