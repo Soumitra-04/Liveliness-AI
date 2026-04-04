@@ -181,10 +181,65 @@ def find_checkpoint() -> Path:
 # Model loading
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Conv-stem key remapping ───────────────────────────────────────────────────
+
+def _remap_conv_stem_keys(state: dict) -> dict:
+    """
+    Translate a pre-BlurPool checkpoint into the new BlurPool architecture.
+
+    Architecture change (spatial.py)
+    ---------------------------------
+    OLD (before BlurPool injection):
+      stream_a.backbone.conv_stem           →  Conv2d(3, 24, stride=2)
+
+    NEW (with BlurPool injected):
+      stream_a.backbone.conv_stem.0         →  Conv2d(3, 24, stride=1)   [weight only]
+      stream_a.backbone.conv_stem.1         →  BlurPool2d                [blur_kernel buffer]
+
+    The Conv2d weight tensor is identical — only the stride changed from 2→1,
+    which is not stored in the weight tensor itself.  We therefore copy
+    'conv_stem.weight' → 'conv_stem.0.weight' verbatim.
+
+    The 'conv_stem.1.blur_kernel' buffer is NOT in old checkpoints — it is a
+    fixed, non-trainable Gaussian kernel that is re-created from scratch every
+    time SpatialStream.__init__ runs, so there is nothing to migrate.
+
+    Returns
+    -------
+    Remapped state dict (new dict, original is not mutated).
+    """
+    OLD_KEY = "stream_a.backbone.conv_stem.weight"
+    NEW_KEY = "stream_a.backbone.conv_stem.0.weight"
+
+    if OLD_KEY not in state:
+        return state   # already new format or unrelated checkpoint
+
+    remapped = {k: v for k, v in state.items() if k != OLD_KEY}
+    remapped[NEW_KEY] = state[OLD_KEY]
+
+    log.info(
+        "Checkpoint remapped: '%s' → '%s'  (BlurPool architecture migration)",
+        OLD_KEY, NEW_KEY,
+    )
+    return remapped
+
+
 def load_model(ckpt_path: Path, device: str) -> nn.Module:
     """
     Load DeepFakeV1Module from a Lightning .ckpt or a plain .pth state_dict.
     Returns the model in eval mode on `device`.
+
+    BlurPool compatibility
+    ----------------------
+    Checkpoints trained before the BlurPool injection store the stem conv
+    weights under 'stream_a.backbone.conv_stem.weight'.  The new architecture
+    expects 'stream_a.backbone.conv_stem.0.weight'.  _remap_conv_stem_keys()
+    performs this rename automatically.
+
+    strict=False is used for .ckpt loading so that the new non-trainable
+    'conv_stem.1.blur_kernel' buffer (a fixed Gaussian — not learned) does not
+    raise a RuntimeError for a missing key.  The buffer is always constructed
+    correctly in SpatialStream.__init__, so no information is lost.
     """
     from app.ai_engine.fusion import DeepFakeV1Module
 
@@ -192,11 +247,39 @@ def load_model(ckpt_path: Path, device: str) -> nn.Module:
 
     if suffix == ".ckpt":
         log.info("Loading Lightning checkpoint…")
-        # load_from_checkpoint reconstructs the model + hparams automatically
-        model = DeepFakeV1Module.load_from_checkpoint(
-            str(ckpt_path),
-            map_location=device,
-        )
+
+        # ── Step 1: peek at the raw state_dict to detect key format ──────────
+        raw = torch.load(str(ckpt_path), map_location="cpu")
+        if "state_dict" in raw:
+            raw["state_dict"] = _remap_conv_stem_keys(raw["state_dict"])
+            # Write back to a temp file isn't needed — Lightning accepts a
+            # pre-modified checkpoint dict via load_from_checkpoint when we
+            # pass the path, so we use the lower-level approach instead:
+            # reconstruct the model from hparams, then load weights manually.
+            hparams = raw.get("hyper_parameters", {})
+            model = DeepFakeV1Module(**hparams)
+            missing, unexpected = model.load_state_dict(
+                raw["state_dict"], strict=False
+            )
+            # Log any genuinely unexpected keys (not the blur_kernel buffer)
+            unexpected_real = [
+                k for k in unexpected
+                if "blur_kernel" not in k
+            ]
+            if missing:
+                log.warning("Keys missing from checkpoint (expected for new layers): %s",
+                            missing)
+            if unexpected_real:
+                log.warning("Unexpected keys in checkpoint (architecture mismatch?): %s",
+                            unexpected_real)
+        else:
+            # Fallback: try direct Lightning load with strict=False
+            model = DeepFakeV1Module.load_from_checkpoint(
+                str(ckpt_path),
+                map_location=device,
+                strict=False,
+            )
+
     elif suffix == ".pth":
         log.info("Loading plain state_dict (.pth)…")
         model = DeepFakeV1Module()      # uses default hparams
@@ -204,7 +287,14 @@ def load_model(ckpt_path: Path, device: str) -> nn.Module:
         # Lightning sometimes wraps state_dict under 'state_dict' key
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
-        model.load_state_dict(state)
+        state = _remap_conv_stem_keys(state)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        unexpected_real = [k for k in unexpected if "blur_kernel" not in k]
+        if missing:
+            log.warning("Keys missing from .pth (expected for new layers): %s", missing)
+        if unexpected_real:
+            log.warning("Unexpected keys in .pth: %s", unexpected_real)
+
     else:
         raise ValueError(
             f"Unsupported checkpoint extension '{suffix}'. "

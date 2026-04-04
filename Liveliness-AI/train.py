@@ -79,9 +79,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-gpu",     action="store_true",
                    help="Disable GPU even if available.")
     p.add_argument("--precision",  type=int,   default=16, choices=[16, 32],
-                   help="Float precision: 16 (mixed, 2× faster) or 32 (default 16).")
+                   help="Float precision: 16 (mixed, 2x faster) or 32 (default 16).")
     p.add_argument("--fast-dev",   action="store_true",
                    help="Run 1 batch of train+val to verify setup, then exit.")
+    p.add_argument("--finetune",   action="store_true",
+                   help=(
+                       "After main training, run a 3-epoch partial-unfreeze "
+                       "fine-tune phase (last 2 EfficientNet blocks, LR=1e-5). "
+                       "Improves domain generalisation. Requires the main run "
+                       "to complete first."
+                   ))
     return p.parse_args()
 
 
@@ -99,10 +106,62 @@ def build_dataloaders(args: argparse.Namespace):
     MEAN = [0.485, 0.456, 0.406]
     STD  = [0.229, 0.224, 0.225]
 
-    # ── Train transform — DegradationTransform injected before normalisation ──
+    # ── Multi-scale JPEG compression helper ───────────────────────────────────
+    class MultiScaleJPEGCompression:
+        """
+        Applies JPEG compression at a quality sampled uniformly from
+        [lo, hi] to simulate the full spectrum of compression quality
+        found in wild images — from pristine camera RAW (q=95) down to
+        heavily compressed social-media reposts (q=25).
+
+        This forces the model to ignore JPEG blocking artefacts as a
+        reliable signal (they are not — they depend entirely on the
+        social-media platform the image passed through, not on whether
+        it is real or fake).
+        """
+        def __init__(self, quality_lo: int = 25, quality_hi: int = 95) -> None:
+            import random
+            self.lo = quality_lo
+            self.hi = quality_hi
+            self._rng = random
+
+        def __call__(self, img):
+            import io
+            quality = self._rng.randint(self.lo, self.hi)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            buf.seek(0)
+            from PIL import Image
+            return Image.open(buf).copy()
+
+    # ── Train transform — domain-generalisation augmentations ────────────────
+    # Augmentation strategy: force the model to ignore colour and compression
+    # quality, which are distribution-specific (social-media filters, cameras).
+    #
+    #   1. ColorJitter: randomly perturbs {brightness, contrast, saturation, hue}
+    #      so the model stops relying on per-dataset colour statistics.
+    #
+    #   2. RandomGrayscale(p=0.15): randomly throws away all colour information.
+    #      This prevents the model from using "too-perfect skin tone" as a proxy
+    #      for deepfake detection (GAN skintones are subtly different but
+    #      this is lost after grayscale, forcing shape-based reasoning).
+    #
+    #   3. MultiScaleJPEGCompression: applies random JPEG quality in [25, 95].
+    #      The model learns that compression artefacts are NOT a reliable signal.
+    #
+    #   4. DegradationTransform: existing on-the-fly JPEG / Gaussian blur / screenshot
+    #      simulation for 20% of samples (defined in spatial.py).
     train_transform = T.Compose([
         T.Resize((224, 224)),
-        DegradationTransform(degradation_prob=0.20),   # 20 % degraded on-the-fly
+        T.ColorJitter(
+            brightness=0.3,   # ±30% brightness variation
+            contrast=0.3,     # ±30% contrast variation
+            saturation=0.2,   # ±20% saturation variation
+            hue=0.05,         # ±0.05 hue shift (subtle — avoids unnatural colours)
+        ),
+        T.RandomGrayscale(p=0.15),        # 15% chance of full desaturation
+        MultiScaleJPEGCompression(quality_lo=25, quality_hi=95),
+        DegradationTransform(degradation_prob=0.20),   # 20% degraded on-the-fly
         T.ToTensor(),
         T.Normalize(mean=MEAN, std=STD),
     ])
@@ -276,6 +335,106 @@ def main() -> None:
     log.info("Load for inference:")
     log.info("  from app.ai_engine.fusion import DeepFakeV1Module")
     log.info("  model = DeepFakeV1Module.load_for_inference('%s')", CKPT_PATH)
+
+    # ── Optional: Domain generalisation fine-tune phase ─────────────────────────
+    if args.finetune:
+        _run_finetune_phase(args, best_ckpt, train_loader, val_loader,
+                            accelerator, devices, precision)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helper — domain generalisation fine-tune phase
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_finetune_phase(
+    args,
+    best_ckpt_path: str | None,
+    train_loader,
+    val_loader,
+    accelerator: str,
+    devices: int,
+    precision: int,
+) -> None:
+    """
+    Partial-Unfreeze Fine-Tune Phase
+    ---------------------------------
+    After the main training run, reload the best checkpoint, freeze the
+    entire EfficientNet backbone, then unfreeze only the last 2 MBConv
+    blocks (stages 4 and 5).  Re-train for 3 epochs with LR=1e-5.
+
+    Why this helps
+    --------------
+    The initial training memorises training-set statistics because the
+    full backbone encodes dataset-specific texture cues.  Partial-unfreeze
+    fine-tuning exposes only the *high-level semantic* layers to new
+    gradient updates.  These layers encode shape, geometry, and semantic
+    composition — which are consistent across domains — while the low-level
+    texture layers (stages 0–3) remain frozen, preventing catastrophic
+    forgetting of the generalised features already learned.
+
+    Saved checkpoint: models/ml_model/best_deepfake_v1_finetune.ckpt
+    """
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+    from pytorch_lightning.loggers import CSVLogger
+    from app.ai_engine.fusion import DeepFakeV1Module
+
+    FINETUNE_EPOCHS = 3
+    FINETUNE_LR     = 1e-5
+    FINETUNE_CKPT   = MODEL_DIR / "best_deepfake_v1_finetune"
+
+    log.info("=" * 64)
+    log.info("  Domain Generalisation Fine-Tune — %d epoch(s) @ LR=%.0e",
+             FINETUNE_EPOCHS, FINETUNE_LR)
+    log.info("  Unfreezing last 2 EfficientNet blocks (stages 4-5)")
+    log.info("=" * 64)
+
+    if not best_ckpt_path:
+        log.error("No checkpoint to fine-tune from. Run without --finetune first.")
+        return
+
+    # Reload best weights, then apply partial_unfreeze to stream_a
+    ft_model = DeepFakeV1Module.load_from_checkpoint(
+        best_ckpt_path,
+        map_location="cpu",
+        # Override hyperparams for fine-tune phase
+        lr=FINETUNE_LR,
+        num_epochs=FINETUNE_EPOCHS,
+    )
+    ft_model.stream_a.partial_unfreeze(n_blocks=2)
+
+    # Checkpoint callback — saves best fine-tuned model
+    ft_ckpt_cb = ModelCheckpoint(
+        dirpath   = str(MODEL_DIR),
+        filename  = "best_deepfake_v1_finetune",
+        monitor   = "val/acc",
+        mode      = "max",
+        save_top_k= 1,
+        verbose   = True,
+    )
+
+    ft_trainer = pl.Trainer(
+        max_epochs       = FINETUNE_EPOCHS,
+        accelerator      = accelerator,
+        devices          = devices,
+        precision        = precision,
+        callbacks        = [ft_ckpt_cb, LearningRateMonitor(logging_interval="epoch")],
+        logger           = CSVLogger(str(ROOT / "logs"), name="deepfake_v1_finetune"),
+        log_every_n_steps= 50,
+        gradient_clip_val= 0.5,    # tighter clip — very low LR, don't overstep
+        deterministic    = False,
+    )
+
+    ft_trainer.fit(ft_model, train_loader, val_loader)
+
+    best_ft = ft_ckpt_cb.best_model_path
+    _export_plain_pth(best_ft, MODEL_DIR / "best_deepfake_v1_finetune.pth")
+
+    log.info("")
+    log.info("✔ Fine-tune complete.")
+    log.info("  Fine-tuned checkpoint : %s", best_ft)
+    log.info("  Use --checkpoint path/to/best_deepfake_v1_finetune.ckpt for inference.")
+    log.info("")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

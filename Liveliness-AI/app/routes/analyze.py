@@ -67,10 +67,11 @@ async def analyze_file(file: UploadFile = File(...)):
     # ── Step 5 — AI Analysis ──────────────────────────────────────────────────
 
     # Default results for modalities not active in this request.
-    # fusion.combine_results() requires all three to be present.
-    image_result = (0.0, "No image processed")
-    video_result = (0.0, "No video processed")
-    audio_result = (0.0, "No audio processed")
+    # None signals to combine_results that the modality was absent so its
+    # weight is excluded from the normalised weighted average.
+    image_result = None
+    video_result = None
+    audio_result = None
 
     if file_type == "image":
         # ELA + pretrained deepfake model → (score, explanation)
