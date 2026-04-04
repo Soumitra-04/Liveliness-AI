@@ -325,6 +325,13 @@ def load_image(image_path: Path) -> tuple["torch.Tensor", "PILImage.Image"]:
     """
     Load and preprocess an image for inference.
 
+    Preprocessing pipeline (MUST match model_singleton.PREPROCESS exactly)
+    -----------------------------------------------------------------------
+    1. PIL.Image.open(path).convert("RGB")
+    2. T.Resize((224, 224))
+    3. T.ToTensor()
+    4. T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
     Returns
     -------
     tensor : (1, 3, 224, 224)  float32  — model input
@@ -336,6 +343,16 @@ def load_image(image_path: Path) -> tuple["torch.Tensor", "PILImage.Image"]:
     pil_img = PILImage.open(image_path).convert("RGB")
     pil_224 = pil_img.resize((224, 224), PILImage.LANCZOS)   # for overlay later
     tensor  = _PREPROCESS(pil_img).unsqueeze(0)              # (1, 3, 224, 224)
+
+    # ── Pixel-value parity log ────────────────────────────────────────────────
+    # These 5 values MUST match the [PARITY-API] line from model_singleton.py
+    # when both are run on the same input image.  Any delta = pipeline mismatch.
+    flat5 = tensor[0].flatten()[:5].tolist()
+    print(
+        f"[PARITY-CLI] first 5 pixel values: "
+        f"{[round(v, 6) for v in flat5]}  | file={image_path}"
+    )
+
     return tensor, pil_224
 
 
